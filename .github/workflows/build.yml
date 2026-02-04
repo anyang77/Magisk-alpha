@@ -30,10 +30,10 @@ jobs:
           is-asset-build: true
 
       - name: Build release
-        run: ./build.py -vr all
+        run: ./build.py -vr -c .github/ci.prop all
 
       - name: Build debug
-        run: ./build.py -v all
+        run: ./build.py -v -c .github/ci.prop all
 
       - name: Stop gradle daemon
         run: ./app/gradlew --stop

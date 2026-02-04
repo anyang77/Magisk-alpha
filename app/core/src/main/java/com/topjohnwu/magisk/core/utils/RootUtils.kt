@@ -47,6 +47,7 @@ class RootUtils(stub: Any?) : RootService() {
             override fun getAppProcess(pid: Int) = safe(null) { getAppProcessImpl(pid) }
             override fun getFileSystem(): IBinder = FileSystemManager.getService()
             override fun addSystemlessHosts() = safe(false) { addSystemlessHostsImpl() }
+            override fun getInstalledPackages(): List<String> = safe(emptyList()) { getInstalledPackagesImpl() }
         }
     }
 
@@ -90,6 +91,34 @@ class RootUtils(stub: Any?) : RootService() {
         File("/system/etc/hosts").copyTo(hosts)
         File(module, "update").createNewFile()
         return true
+    }
+
+    private fun getInstalledPackagesImpl(): List<String> {
+        return try {
+            val pm = packageManager
+            // Calculate userId: uid / 100000 (Android's user ID calculation)
+            val userId = android.os.Process.myUid() / 100000
+
+            // Use reflection to call hidden API getInstalledPackagesAsUser
+            val method = pm.javaClass.getDeclaredMethod(
+                "getInstalledPackagesAsUser",
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType
+            )
+            method.isAccessible = true
+            val flags = android.content.pm.PackageManager.MATCH_UNINSTALLED_PACKAGES
+            @Suppress("UNCHECKED_CAST")
+            val packages = method.invoke(pm, flags, userId) as List<android.content.pm.PackageInfo>
+
+            // Filter to only third-party apps (non-system)
+            packages
+                .filter { it.applicationInfo != null }
+                .filter { (it.applicationInfo!!.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) == 0 }
+                .map { it.packageName }
+        } catch (e: Throwable) {
+            Timber.e(e, "Failed to get installed packages via reflection")
+            emptyList()
+        }
     }
 
     object Connection : AbstractQueuedSynchronizer(), ServiceConnection {
@@ -152,6 +181,8 @@ class RootUtils(stub: Any?) : RootService() {
             }
 
         fun getAppProcess(pid: Int) = safe(null) { obj?.getAppProcess(pid) }
+
+        fun getInstalledPackages(): List<String> = safe(emptyList()) { obj?.getInstalledPackages() ?: emptyList() }
 
         suspend fun addSystemlessHosts() =
             withContext(Dispatchers.IO) { safe(false) { obj?.addSystemlessHosts() ?: false } }

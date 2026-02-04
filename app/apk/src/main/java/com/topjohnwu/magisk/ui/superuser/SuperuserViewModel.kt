@@ -16,6 +16,7 @@ import com.topjohnwu.magisk.core.R
 import com.topjohnwu.magisk.core.data.magiskdb.PolicyDao
 import com.topjohnwu.magisk.core.ktx.getLabel
 import com.topjohnwu.magisk.core.model.su.SuPolicy
+import com.topjohnwu.magisk.core.utils.RootUtils
 import com.topjohnwu.magisk.databinding.MergeObservableList
 import com.topjohnwu.magisk.databinding.RvItem
 import com.topjohnwu.magisk.databinding.bindExtra
@@ -27,6 +28,10 @@ import com.topjohnwu.magisk.events.SnackbarEvent
 import com.topjohnwu.magisk.utils.asText
 import com.topjohnwu.magisk.view.TextItem
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.asFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.flow.toCollection
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
@@ -45,6 +50,7 @@ class SuperuserViewModel(
         .insertList(itemsPolicies)
     val extraBindings = bindExtra {
         it.put(BR.listener, this)
+        it.put(BR.viewModel, this)
     }
 
     @get:Bindable
@@ -54,53 +60,76 @@ class SuperuserViewModel(
     @SuppressLint("InlinedApi")
     override suspend fun doLoadWork() {
         if (!Info.showSuperUser) {
-            loading = false
             return
         }
+
         loading = true
-        withContext(Dispatchers.IO) {
+
+        // Fetch data in IO thread
+        val policyItems = withContext(Dispatchers.IO) {
             db.deleteOutdated()
             db.delete(AppContext.applicationInfo.uid)
-            val policies = ArrayList<PolicyRvItem>()
+
+            // Fetch all authorization records from database
+            val policyMap = db.fetchAll().associateBy { it.uid }
             val pm = AppContext.packageManager
-            for (policy in db.fetchAll()) {
-                val pkgs =
-                    if (policy.uid == Process.SYSTEM_UID) arrayOf("android")
-                    else pm.getPackagesForUid(policy.uid)
-                if (pkgs == null) {
-                    db.delete(policy.uid)
-                    continue
-                }
-                val map = pkgs.mapNotNull { pkg ->
+
+            // Get all third-party apps via root service
+            val packageNames = RootUtils.getInstalledPackages()
+            val items = packageNames.asFlow()
+                .filter { it != AppContext.packageName }
+                .mapNotNull { packageName ->
                     try {
-                        val info = pm.getPackageInfo(pkg, MATCH_UNINSTALLED_PACKAGES)
+                        val info = pm.getPackageInfo(packageName, MATCH_UNINSTALLED_PACKAGES)
+                        val applicationInfo = info.applicationInfo ?: return@mapNotNull null
+
+                        // Get existing policy or create new one with QUERY status
+                        val policy = policyMap[applicationInfo.uid] ?: SuPolicy(
+                            uid = applicationInfo.uid,
+                            policy = SuPolicy.QUERY
+                        )
+
                         PolicyRvItem(
                             this@SuperuserViewModel, policy,
                             info.packageName,
                             info.sharedUserId != null,
-                            info.applicationInfo?.loadIcon(pm) ?: pm.defaultActivityIcon,
-                            info.applicationInfo?.getLabel(pm) ?: info.packageName
+                            applicationInfo.loadIcon(pm),
+                            applicationInfo.getLabel(pm) ?: packageName
                         )
                     } catch (e: PackageManager.NameNotFoundException) {
                         null
                     }
-                }
-                if (map.isEmpty()) {
-                    db.delete(policy.uid)
-                    continue
-                }
-                policies.addAll(map)
+                }.toCollection(ArrayList<PolicyRvItem>())
+
+            // Add shell (UID 2000) if not already in list
+            val shellUid = 2000
+            if (items.none { it.item.uid == shellUid }) {
+                val shellPolicy = policyMap[shellUid] ?: SuPolicy(
+                    uid = shellUid,
+                    policy = SuPolicy.QUERY
+                )
+                items.add(PolicyRvItem(
+                    this@SuperuserViewModel, shellPolicy,
+                    "com.android.shell",
+                    false,
+                    pm.defaultActivityIcon,
+                    "Shell"
+                ))
             }
-            policies.sortWith(compareBy(
+
+            // Sort: ALLOW apps first, DENY/QUERY apps after, then by app name
+            items.sortWith(compareBy(
+                { it.item.policy == SuPolicy.QUERY },  // QUERY last
+                { it.item.policy != SuPolicy.ALLOW },  // ALLOW first
                 { it.appName.lowercase(Locale.ROOT) },
                 { it.packageName }
             ))
-            itemsPolicies.update(policies)
+
+            items
         }
-        if (itemsPolicies.isNotEmpty())
-            itemsHelpers.clear()
-        else if (itemsHelpers.isEmpty())
-            itemsHelpers.add(itemNoData)
+
+        // Update list on main thread
+        itemsPolicies.update(policyItems)
         loading = false
     }
 
@@ -109,12 +138,7 @@ class SuperuserViewModel(
     fun deletePressed(item: PolicyRvItem) {
         fun updateState() = viewModelScope.launch {
             db.delete(item.item.uid)
-            val list = ArrayList(itemsPolicies)
-            list.removeAll { it.item.uid == item.item.uid }
-            itemsPolicies.update(list)
-            if (list.isEmpty() && itemsHelpers.isEmpty()) {
-                itemsHelpers.add(itemNoData)
-            }
+            doLoadWork()
         }
 
         if (Config.suAuth) {
@@ -126,15 +150,12 @@ class SuperuserViewModel(
 
     fun updateNotify(item: PolicyRvItem) {
         viewModelScope.launch {
-            db.update(item.item)
+            withContext(Dispatchers.IO) {
+                db.update(item.item)
+            }
             val res = when {
                 item.item.notification -> R.string.su_snack_notif_on
                 else -> R.string.su_snack_notif_off
-            }
-            itemsPolicies.forEach {
-                if (it.item.uid == item.item.uid) {
-                    it.notifyPropertyChanged(BR.shouldNotify)
-                }
             }
             SnackbarEvent(res.asText(item.appName)).publish()
         }
@@ -142,32 +163,43 @@ class SuperuserViewModel(
 
     fun updateLogging(item: PolicyRvItem) {
         viewModelScope.launch {
-            db.update(item.item)
+            withContext(Dispatchers.IO) {
+                db.update(item.item)
+            }
             val res = when {
                 item.item.logging -> R.string.su_snack_log_on
                 else -> R.string.su_snack_log_off
-            }
-            itemsPolicies.forEach {
-                if (it.item.uid == item.item.uid) {
-                    it.notifyPropertyChanged(BR.shouldLog)
-                }
             }
             SnackbarEvent(res.asText(item.appName)).publish()
         }
     }
 
     fun updatePolicy(item: PolicyRvItem, policy: Int) {
-        val items = itemsPolicies.filter { it.item.uid == item.item.uid }
         fun updateState() {
             viewModelScope.launch {
-                val res = if (policy >= SuPolicy.ALLOW) R.string.su_snack_grant else R.string.su_snack_deny
-                item.item.policy = policy
-                db.update(item.item)
-                items.forEach {
-                    it.notifyPropertyChanged(BR.enabled)
-                    it.notifyPropertyChanged(BR.sliderValue)
+                try {
+                    withContext(Dispatchers.IO) {
+                        if (policy >= SuPolicy.ALLOW) {
+                            // Grant: update or create policy
+                            item.item.policy = policy
+                            db.update(item.item)
+                        } else {
+                            // Deny: delete the policy completely
+                            db.delete(item.item.uid)
+                        }
+                    }
+                    // Show snackbar on main thread
+                    val res = if (policy >= SuPolicy.ALLOW) {
+                        R.string.su_snack_grant.asText(item.appName)
+                    } else {
+                        R.string.su_snack_deny.asText(item.appName)
+                    }
+                    SnackbarEvent(res).publish()
+                    // Reload to show updated list
+                    doLoadWork()
+                } catch (e: Exception) {
+                    SnackbarEvent("Error: ${e.message}").publish()
                 }
-                SnackbarEvent(res.asText(item.appName)).publish()
             }
         }
 
